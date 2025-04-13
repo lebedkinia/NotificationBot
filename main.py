@@ -8,8 +8,9 @@ from config import BOT_TOKEN
 from database import ReminderDatabase
 from kafka_handler import KafkaNotificationHandler, start_kafka_consumer
 from kafka.errors import NoBrokersAvailable
+from reminder_sender import start_reminder_sender
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 
 # Configure logging
@@ -18,6 +19,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Set your local timezone (GMT+3)
+LOCAL_TIMEZONE = timezone(timedelta(hours=3))
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -66,7 +70,11 @@ async def process_text(message: Message, state: FSMContext):
 @dp.message(ReminderStates.waiting_for_start_time)
 async def process_start_time(message: Message, state: FSMContext):
     try:
-        start_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        # Parse local time and convert to UTC
+        local_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        local_time = local_time.replace(tzinfo=LOCAL_TIMEZONE)
+        start_time = local_time.astimezone(timezone.utc)
+        
         await state.update_data(start_time=start_time)
         await message.answer(
             "Теперь введите время окончания напоминаний в том же формате:\n"
@@ -82,7 +90,11 @@ async def process_start_time(message: Message, state: FSMContext):
 @dp.message(ReminderStates.waiting_for_end_time)
 async def process_end_time(message: Message, state: FSMContext):
     try:
-        end_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        # Parse local time and convert to UTC
+        local_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        local_time = local_time.replace(tzinfo=LOCAL_TIMEZONE)
+        end_time = local_time.astimezone(timezone.utc)
+        
         data = await state.get_data()
         start_time = data['start_time']
         
@@ -127,10 +139,14 @@ async def process_frequency(message: Message, state: FSMContext):
             remind_id += 1
             current_time += timedelta(minutes=frequency)
         
+        # Convert times back to local timezone for display
+        local_start = start_time.astimezone(LOCAL_TIMEZONE)
+        local_end = end_time.astimezone(LOCAL_TIMEZONE)
+        
         await message.answer(
             f"Отлично! Напоминания созданы:\n"
             f"Текст: {text}\n"
-            f"С {start_time.strftime('%d.%m.%Y %H:%M')} до {end_time.strftime('%d.%m.%Y %H:%M')}\n"
+            f"С {local_start.strftime('%d.%m.%Y %H:%M')} до {local_end.strftime('%d.%m.%Y %H:%M')}\n"
             f"Каждые {frequency} минут"
         )
         await state.clear()
@@ -138,11 +154,50 @@ async def process_frequency(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Пожалуйста, введите целое число для частоты напоминаний:")
 
+@dp.message(Command("list_reminds"))
+async def list_reminds(message: Message):
+    db = ReminderDatabase()
+    db.connect()
+    try:
+        with db.conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT chat_id, text, time FROM reminders WHERE chat_id = %s ORDER BY time",
+                (message.from_user.id,)
+            )
+            reminders = cursor.fetchall()
+            
+            if not reminders:
+                await message.answer("У вас пока нет напоминаний")
+                return
+                
+            response = "Ваши напоминания:\n\n"
+            for i, reminder in enumerate(reminders, 1):
+                chat_id, text, time_value = reminder
+                # Check if time_value is already a datetime object
+                if isinstance(time_value, datetime):
+                    utc_time = time_value.replace(tzinfo=timezone.utc)
+                else:
+                    # If it's a string, parse it
+                    utc_time = datetime.strptime(time_value, "%Y-%m-%d %H:%M:%S+00").replace(tzinfo=timezone.utc)
+                
+                local_time = utc_time.astimezone(LOCAL_TIMEZONE)
+                response += f"{i}. {text}\nВремя: {local_time.strftime('%d.%m.%Y %H:%M')}\n\n"
+            
+            await message.answer(response)
+    except Exception as e:
+        logger.error(f"Error listing reminders: {e}")
+        await message.answer("Произошла ошибка при получении списка напоминаний")
+    finally:
+        db.close()
+
 async def main():
     try:
         # Start Kafka consumer in a separate task
         asyncio.create_task(asyncio.to_thread(start_kafka_consumer))
         logger.info("Kafka consumer started")
+        
+        # Start reminder sender
+        start_reminder_sender()
         
         # Start the bot
         await dp.start_polling(bot)
