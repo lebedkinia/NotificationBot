@@ -124,9 +124,12 @@ async def process_frequency(message: Message, state: FSMContext):
         end_time = data['end_time']
         text = data['text']
         
+        # Generate a single remind_id for all reminders in this series
+        remind_id = int(datetime.utcnow().timestamp())
+        
         # Generate reminders and send to Kafka
         current_time = start_time
-        remind_id = 1  # You might want to generate unique IDs
+        reminders_count = 0
         
         while current_time <= end_time:
             notification_data = {
@@ -136,7 +139,7 @@ async def process_frequency(message: Message, state: FSMContext):
                 'time': current_time.strftime("%Y-%m-%d %H:%M:%S+00")
             }
             kafka_handler.send_notification(notification_data)
-            remind_id += 1
+            reminders_count += 1
             current_time += timedelta(minutes=frequency)
         
         # Convert times back to local timezone for display
@@ -147,7 +150,8 @@ async def process_frequency(message: Message, state: FSMContext):
             f"Отлично! Напоминания созданы:\n"
             f"Текст: {text}\n"
             f"С {local_start.strftime('%d.%m.%Y %H:%M')} до {local_end.strftime('%d.%m.%Y %H:%M')}\n"
-            f"Каждые {frequency} минут"
+            f"Каждые {frequency} минут\n"
+            f"Всего напоминаний: {reminders_count}"
         )
         await state.clear()
         
@@ -160,28 +164,37 @@ async def list_reminds(message: Message):
     db.connect()
     try:
         with db.conn.cursor() as cursor:
+            # Get unique remind_ids for this user
             cursor.execute(
-                "SELECT chat_id, text, time FROM reminders WHERE chat_id = %s ORDER BY time",
+                """
+                SELECT DISTINCT remind_id, text, MIN(time) as first_time, MAX(time) as last_time 
+                FROM reminders 
+                WHERE chat_id = %s 
+                GROUP BY remind_id, text 
+                ORDER BY first_time
+                """,
                 (message.from_user.id,)
             )
-            reminders = cursor.fetchall()
+            reminder_series = cursor.fetchall()
             
-            if not reminders:
+            if not reminder_series:
                 await message.answer("У вас пока нет напоминаний")
                 return
                 
             response = "Ваши напоминания:\n\n"
-            for i, reminder in enumerate(reminders, 1):
-                chat_id, text, time_value = reminder
-                # Check if time_value is already a datetime object
-                if isinstance(time_value, datetime):
-                    utc_time = time_value.replace(tzinfo=timezone.utc)
-                else:
-                    # If it's a string, parse it
-                    utc_time = datetime.strptime(time_value, "%Y-%m-%d %H:%M:%S+00").replace(tzinfo=timezone.utc)
+            for i, series in enumerate(reminder_series, 1):
+                remind_id, text, first_time, last_time = series
                 
-                local_time = utc_time.astimezone(LOCAL_TIMEZONE)
-                response += f"{i}. {text}\nВремя: {local_time.strftime('%d.%m.%Y %H:%M')}\n\n"
+                # Convert times to local timezone
+                first_time = first_time.replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
+                last_time = last_time.replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
+                
+                response += (
+                    f"{i}. Серия напоминаний #{remind_id}\n"
+                    f"Текст: {text}\n"
+                    f"Период: с {first_time.strftime('%d.%m.%Y %H:%M')} "
+                    f"до {last_time.strftime('%d.%m.%Y %H:%M')}\n\n"
+                )
             
             await message.answer(response)
     except Exception as e:
