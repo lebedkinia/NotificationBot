@@ -43,8 +43,11 @@ def check_and_send_reminders():
         with db.conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT chat_id, text, remind_id FROM reminders 
-                WHERE time <= %s AND time > %s
+                SELECT r.id, r.chat_id, r.text, r.remind_id, rs.end_time 
+                FROM reminders r
+                JOIN reminder_series rs ON r.remind_id = rs.remind_id
+                WHERE r.time <= %s AND r.time > %s
+                ORDER BY r.time
                 """,
                 (current_time.strftime("%Y-%m-%d %H:%M:%S+00"), 
                  one_minute_ago.strftime("%Y-%m-%d %H:%M:%S+00"))
@@ -57,27 +60,37 @@ def check_and_send_reminders():
                 
             logger.info(f"Found {len(reminders)} reminders to send")
             
-            # Create new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Create new event loop for this thread if it doesn't exist
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             
             for reminder in reminders:
-                chat_id, text, remind_id = reminder
-                logger.info(f"Processing reminder: chat_id={chat_id}, text={text}, remind_id={remind_id}")
+                reminder_id, chat_id, text, remind_id, end_time = reminder
+                logger.info(f"Processing reminder: id={reminder_id}, chat_id={chat_id}, text={text}, remind_id={remind_id}")
                 
-                # Run the coroutine in the new event loop
-                loop.run_until_complete(send_reminder(chat_id, text))
-                
-                # Delete the reminder after sending
-                cursor.execute(
-                    "DELETE FROM reminders WHERE remind_id = %s",
-                    (remind_id,)
-                )
-                db.conn.commit()
-                logger.info(f"Deleted reminder with remind_id {remind_id}")
-            
-            # Close the event loop
-            loop.close()
+                try:
+                    # Run the coroutine in the event loop
+                    loop.run_until_complete(send_reminder(chat_id, text))
+                    
+                    # Delete this specific reminder
+                    cursor.execute(
+                        "DELETE FROM reminders WHERE id = %s",
+                        (reminder_id,)
+                    )
+                    db.conn.commit()
+                    logger.info(f"Deleted reminder with id {reminder_id}")
+                    
+                    # If this is the last reminder in the series (current time >= end_time)
+                    if current_time >= end_time:
+                        db.delete_reminder_series(remind_id)
+                        logger.info(f"Deleted reminder series with remind_id {remind_id}")
+                            
+                except Exception as e:
+                    logger.error(f"Error processing reminder {reminder_id}: {e}")
+                    continue
                 
     except Exception as e:
         logger.error(f"Error in check_and_send_reminders: {e}")

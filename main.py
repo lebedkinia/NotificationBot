@@ -96,17 +96,17 @@ def parse_date_time(date_str: str, user_id: int) -> tuple[datetime, bool]:
 
     # Special cases
     if date_str.lower() == "n":
-        return now, False
+        return now.astimezone(timezone.utc), False
 
     if date_str.lower() == "d":
         end_of_day = now.replace(hour=23, minute=59, second=59)
-        return end_of_day, True
+        return end_of_day.astimezone(timezone.utc), True
 
     if date_str.lower() == "w":
         days_until_end_of_week = 6 - now.weekday()
         end_of_week = now + timedelta(days=days_until_end_of_week)
         end_of_week = end_of_week.replace(hour=23, minute=59, second=59)
-        return end_of_week, True
+        return end_of_week.astimezone(timezone.utc), True
 
     if date_str.lower() == "m":
         if now.month == 12:
@@ -116,7 +116,7 @@ def parse_date_time(date_str: str, user_id: int) -> tuple[datetime, bool]:
         else:
             end_of_month = now.replace(month=now.month + 1, day=1) - timedelta(days=1)
         end_of_month = end_of_month.replace(hour=23, minute=59, second=59)
-        return end_of_month, True
+        return end_of_month.astimezone(timezone.utc), True
 
     # Regular date parsing
     try:
@@ -345,6 +345,23 @@ async def process_frequency(message: Message, state: FSMContext):
 
         # Generate a single remind_id for all reminders in this series
         remind_id = int(datetime.utcnow().timestamp())
+
+        # Store reminder series information
+        db = ReminderDatabase()
+        db.connect()
+        try:
+            db.add_reminder_series(
+                chat_id=message.from_user.id,
+                remind_id=remind_id,
+                text=text,
+                end_time=end_time.strftime("%Y-%m-%d %H:%M:%S+00")
+            )
+        except Exception as e:
+            logger.error(f"Error storing reminder series: {e}")
+            await message.answer("Произошла ошибка при создании напоминаний")
+            return
+        finally:
+            db.close()
 
         # Generate reminders and send to Kafka
         current_time = start_time
